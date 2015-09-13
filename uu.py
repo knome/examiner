@@ -39,7 +39,14 @@ MEMOIZATION = {
     }
 
 # for the File__BlockDevice class
+# 
 FILE_BLOCK_SIZE = 4096
+
+# this is a just in case mechanism to avoid stomping the memory
+# todo: there should be a flag or something to turn it off or
+#   change its value or something
+# 
+MAXIMUM_ALLOWED_READ = 64 * 1024
 
 ####################################################################################
 ## simple print statement debuggers to active / deactivate during development
@@ -97,6 +104,13 @@ class Cursor():
     
     def readlen( self, amount ):
         if amount < 0: raise Exception( 'recieved negative amount' )
+        
+        if amount > MAXIMUM_ALLOWED_READ:
+            raise Exception(
+                'read request for %s bytes exceeds current max of %s bytes' % (
+                    repr( amount               ) ,
+                    repr( MAXIMUM_ALLOWED_READ ) ,
+                    ))
         
         chunk, chunklen = rv = self._rado.readatlen( self._position, amount )
         self._position += chunklen
@@ -3243,25 +3257,118 @@ class Archive__Stuff_It_Five():
         self._archiveSize            = cursor.uint32msb()
         self._firstEntryHeaderOffset = cursor.uint32msb()
         
-        print 'archiveSize:%s firstEntryHeaderOffset:%s' % (
-            repr( self._archiveSize            ) ,
-            repr( self._firstEntryHeaderOffset ) ,
-            )
+        # print 'archiveSize:%s firstEntryHeaderOffset:%s' % (
+        #     repr( self._archiveSize            ) ,
+        #     repr( self._firstEntryHeaderOffset ) ,
+        #     )
         
         cursor.seek( self._firstEntryHeaderOffset )
-        firstEntryHeader = self._read_first_entry_header( cursor )
         
-        print firstEntryHeader
+        self._read_entry( cursor )
         
         return
     
     def is_listable( self ): return True
     def is_radoable( self ): return False
     
-    def _read_first_entry_header( self, cursor ):
+    def list( self ):
+        # can the first entry ever not be a directory?
+        # we'd have to peek at the header to determine
+        # what to do here if that is the case
+        # also, to determine if we're listable or radoable
+        # maybe we should do a little peek and fail here
+        # just in case
+        # 
+        return Archive__Stuff_It_Five__Directory(
+            rado   = self._rado                   ,
+            base   = self                         ,
+            offset = self._firstEntryHeaderOffset ,
+            ).list()
+    
+    def select( self, what ):
+        return Archive__Stuff_It_Five__Directory(
+            rado   = self._rado                   ,
+            base   = self                         ,
+            offset = self._firstEntryHeaderOffset ,
+            ).select( what )
+    
+    def _read_entry( self, cursor ):
+        # read an entry, be it folder or file or whatever
+        # 
         attributes = Attributes()
         
-        attributes.put( 'identifier'  , cursor.uint32msb() )
+        startPosition = cursor.tell()
+        commonHeader  = self._read_common_entry_header( cursor )
+        attributes.put( 'common-header', commonHeader )
+        commonLength  = cursor.tell() - startPosition
+        
+        # print 'size: %s' % (
+        #     repr( commonLength ) ,
+        #     )
+        # 
+        # print 'remaining: %s' % (
+        #     repr( commonHeader.get( 'header-size' ) - commonLength ) ,
+        #     )
+        # 
+        # print 'COMMON HEADER'
+        # print attributes.get( 'common-header' )
+        
+        if attributes.get( 'common-header' ).get( 'first-child-entry-offset' ) == 0xffffffff:
+            attributes.put( '@is-marker', True )
+            return attributes
+        else:
+            attributes.put( '@is-marker', False )
+        
+        startPosition = cursor.tell()
+        if commonHeader.get('flags').get('folder'):
+            attributes.put( '@is-folder', True )
+            folderHeader = self._read_folder_header(
+                commonHeader = commonHeader ,
+                cursor       = cursor       ,
+                )
+            attributes.put( 'folder-header', folderHeader )
+            
+        else:
+            attributes.put( '@is-folder', False )
+            fileHeader = self._read_file_header(
+                commonHeader = commonHeader ,
+                cursor       = cursor       ,
+                )
+            attributes.put( 'file-header', fileHeader )
+            
+            postHeader = self._read_file_post_header(
+                cursor = cursor ,
+                )
+            attributes.put( 'post-header', postHeader )
+            
+        specificLength = cursor.tell() - startPosition
+        
+        # print 'specificSize: %s' % (
+        #     repr( specificLength ) ,
+        #     )
+        # 
+        # print attributes
+        
+        return attributes
+        
+    def _read_common_entry_header( self, cursor ):
+        # this section is the same for file and folder entries
+        # 
+        
+        attributes = Attributes()
+        
+        startPos = cursor.tell()
+        
+        attributes.put( '@start', startPos )
+        
+        attributes.put( 'identifier'  , hex( cursor.uint32msb() ) )
+        
+        if attributes.get( 'identifier' ) != '0xa5a5a5a5':
+            raise Exception(
+                'bad identifier locating entry header : should be 0xa5a5a5a5 : found %s' % (
+                    repr( attributes.get( 'identifier' ) ) ,
+                    ))
+        
         attributes.put( 'version'     , cursor.uint8()     )
         attributes.put( 'unknown'     , cursor.read( 1 )   )
         attributes.put( 'header-size' , cursor.uint16msb() )
@@ -3271,7 +3378,7 @@ class Archive__Stuff_It_Five():
         # whether the entry is a file or folder depends on bit 6 of this flag
         # if set, it is a folder, which has a different format we'll need to write out
         # 
-        attributes.put( 'flags' , cursor.uint8()     )
+        attributes.put( 'flags', self._read_flags( cursor ) )
         
         # uses old mac seconds since 1904 format
         # 
@@ -3285,24 +3392,227 @@ class Archive__Stuff_It_Five():
         attributes.put( 'filename-size' , cursor.uint16msb() )
         attributes.put( 'header-crc-16' , cursor.uint16msb() )
         
-        attributes.put( 'data-fork-uncompressed-length', cursor.uint32msb() )
-        attributes.put( 'data-fork-compressed-length'  , cursor.uint32msb() )
-        attributes.put( 'data-fork-crc-16'             , cursor.uint16msb() )
+        # was data-fork-uncompressed-length in original
+        # there is a note that if this is 0xffffffff
+        # the entry is an unknown marker and should be ignored
+        # 
+        attributes.put( 'first-child-entry-offset'    , cursor.uint32msb() )
+        attributes.put( 'data-fork-compressed-length' , cursor.uint32msb() )
+        attributes.put( 'data-fork-crc-16'            , cursor.uint16msb() )
         
-        attributes.put( 'unknown-3' , cursor.read( 1 ) )
+        attributes.put( 'unknown-3'                   , cursor.read( 1 ) )
+        
+        attributes.put( '@end', cursor.tell() )
+        
+        return attributes
+    
+    def _read_flags( self, cursor ):
+        attributes = Attributes()
+        
+        flagValue = cursor.uint8()
+        
+        attributes.put( 'encrypted', bool( flagValue & 0b00100000 ) )
+        attributes.put( 'folder'   , bool( flagValue & 0b01000000 ) )
+        attributes.put( 'unknown'  , bin(  flagValue & 0b10011111 ) )
+        
+        # actually, this might indicate a "file" rather than a folder
+        # actually, it might indicate "no comment"?
+        #   maybe files just don't have commnets?
+        # 
+        attributes.put( '?end-of-entries', bool( flagValue & 0b00010000 ) )
+        
+        return attributes
+        
+    def _read_file_header( self, commonHeader, cursor ):
+        attributes = Attributes()
+        
+        # this is a guess based on eyeballing bad offsets in the data
+        # 
+        attributes.put( '?bump', cursor.read( 1 ) )
         
         attributes.put( 'data-fork-compression-method', cursor.uint8() )
         
-        attributes.put( 'further-entries', 'ignored' )
+        attributes.put( 'password-data-length'        , cursor.uint8() )
+        attributes.put( 'password-information'                                  ,
+                        cursor.read( attributes.get( 'password-data-length' ) ) ,
+                        )
+        
+        attributes.put( 'file-name', cursor.read( commonHeader.get( 'filename-size' ) ) )
+        
+        # was trying this...
+        # 
+        # attributes.put( 'comment-size', cursor.uint8() )
+        
+        # attributes.put( 'comment-size', cursor.uint16msb() )
+        
+        # attributes.put( '@bamp'       , cursor.read( 1 ) )
+        
+        # attributes.put( 'unknown'     , cursor.uint16msb() )
+        
+        attributes.put( '@here-offset', cursor.tell() - commonHeader.get( '@start' ) )
+        
+        # attributes.put( 'comment', cursor.read( attributes.get( 'comment-size' ) ) )
+        
+        return attributes
+    
+    def _read_file_post_header( self, cursor ):
+        attributes = Attributes()
+        
+        attributes.put( 'flags-2'             , cursor.uint16msb()        )
+        attributes.put( '@flags-2'            , bin( attributes.get( 'flags-2' ) ) )
+        
+        attributes.put( 'unknown'             , cursor.read( 2 )          )
+        attributes.put( 'mac-os-file-type'    , cursor.read( 4 )          )
+        attributes.put( 'mac-os-file-creator' , cursor.read( 4 )          )
+        attributes.put( 'mac-os-finder-flags' , bin( cursor.uint16msb() ) )
+        attributes.put( 'unknown-2'           , cursor.read( 2 )          )
+        attributes.put( 'unknown-3'           , cursor.read( 3 )          )
+        attributes.put( 'unknown-4'           , cursor.read( 12 )         )
+        
+        if 0b00000100 & attributes.get( 'flags-2' ):
+            attributes.put( 'resource-fork-uncompressed-length', cursor.uint32msb() )
+            attributes.put( 'resource-fork-compressed-length'  , cursor.uint32msb() )
+            attributes.put( 'resource-fork-crc-16'             , cursor.uint16msb() )
+            
+        attributes.put( 'unknown-5'                       , cursor.read( 2 ) )
+        attributes.put( 'resource-fork-compression-method', cursor.uint8()   )
+        attributes.put( 'unknown-6'                       , cursor.read( 1 ) )
+        
+        return attributes
+    
+    def _read_folder_header( self, commonHeader, cursor ):
+        attributes = Attributes()
+        
+        # wait a sec, where are we supposed to get the password length from?
+        # ( reading 5 because a comment says that's standard, for now
+        # 
+        
+        # order of attributes here is unsure right now
+        # I'm kind of making things up to see what works
+        # 
+        
+        start = cursor.tell()
+        
+        attributes.put( 'unknown', cursor.uint8() )
+        
+        attributes.put( 'number-of-files', cursor.uint16msb() )
+        
+        attributes.put( 'file-name', cursor.read( commonHeader.get( 'filename-size' ) ) )
+        
+        attributes.put( 'comment-size', cursor.uint16msb() )
+        
+        # attributes.put( 'unknown-pw-bump', cursor.read( 2 ) )
+        
+        # attributes.put( 'password-data-length', cursor.uint8() )
+        # attributes.put( 'password-information', cursor.read( attributes.get( 'password-data-length' ) ) )
+        
+        # attributes.put( 'unknown-2'     , cursor.read( 4 )  )
+        
+        attributes.put( 'comment', cursor.read( attributes.get( 'comment-size' ) ) )
+        
+        attributes.put( '@size', cursor.tell() - start )
+        
+        attributes.put( '@total', attributes.get( '@size' ) + (
+                commonHeader.get( '@end' ) - commonHeader.get( '@start' )
+                ))
+        
+        cp = cursor.tell()
+        attributes.put( '@after', cursor.uint8() )
+        cursor.seek( cp )
         
         return attributes
 
+
+class Archive__Stuff_It_Five__Directory():
+    def __init__( self, rado, base, offset ):
+        # base is used to access helper functions
+        # if it looks confusing we can move them
+        # into a different common class for the lot
+        # 
+        # offset is the offset of the first entry
+        # in the current directory
+        # 
+        
+        self._rado   = rado
+        self._base   = base
+        self._offset = offset
+        return
+    
+    def _folder_entry_headers( self ):
+        cursor = self._rado.cursor()
+        cursor.seek( self._offset )
+        
+        while True:
+            header = self._base._read_entry( cursor )
+            
+            if not header.get( '@is-marker' ):
+                yield header
+            
+            nextOffset = header.get('common-header').get( 'offset-next-entry' )
+            
+            if not nextOffset:
+                return
+            else:
+                cursor.seek( nextOffset )
+    
+    def is_listable( self ): return True
+    def is_radoable( self ): return False
+    
+    def list( self ):
+        entries = []
+        
+        for header in self._folder_entry_headers():
+            if header.get( '@is-folder' ):
+                entries.append((
+                        header.get( 'folder-header' ).get( 'file-name' ) ,
+                        'folder'                                         ,
+                        ))
+            else:
+                entries.append((
+                        header.get( 'file-header' ).get( 'file-name' ) ,
+                        'file'                                         ,
+                        ))
+                
+        return entries
+    
+    def select( self, what ):
+        for header in self._folder_entry_headers():
+            if header.get( '@is-folder' ):
+                if header.get( 'folder-header' ).get( 'file-name' ) == what:
+                    return Archive__Stuff_It_Five__Directory(
+                        rado   = self._rado                                                      ,
+                        base   = self._base                                                      ,
+                        offset = header.get( 'common-header' ).get( 'first-child-entry-offset' ) ,
+                        )
+            else:
+                if header.get( 'file-header' ).get( 'file-name' ) == what:
+                    return Archive__Stuff_It_Five__File(
+                        rado   = self._rado ,
+                        base   = self._base ,
+                        header = header     ,
+                        )
+                
+        return None
+
+
+class Archive__Stuff_It_Five__File():
+    def __init__( self, rado, base, header ):
+        self._rado   = rado
+        self._base   = base
+        self._header = header
+        
+        raise Exception( 'file unimplemented' )
+
+        
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
 #- test block layout
 #- 
 
 @model
 class Test__BlockLayout():
+    # this was used to seek around the data in whatever binary it was attached to
+    # 
+    
     name = 'test--block-layout'
     
     @staticmethod
