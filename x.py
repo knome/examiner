@@ -1,6 +1,7 @@
 
 import sys
 
+import subprocess
 from contextlib import contextmanager
 
 import uu
@@ -20,12 +21,15 @@ def main():
     with open( targetFilename ) as ff:
         print '-open %s' % repr( targetFilename )
         
+        fileBlockDevice = uu.File__BlockDevice(
+            name    = 'initial-file-blockdevice' ,
+            fileobj = ff                         ,
+            )
+        
         rado = uu.RadoBlock( 
             name        = 'initial-file-rado-block' ,
-            blockDevice = uu.File__BlockDevice(
-                name    = 'initial-file-blockdevice' ,
-                fileobj = ff                         ,
-                ))
+            blockDevice = fileBlockDevice           ,
+            )
         
         currentModel = uu.ModelUnknownBlob( rado )
         
@@ -136,6 +140,44 @@ def main():
                 print '\\--'
                 continue
             
+            if argument == '-hex':
+                print argument
+                
+                cursor = currentModel.rado().cursor()
+                
+                def two( v ):
+                    if len( v ) == 1: return '0' + v
+                    return v
+                
+                while True:
+                    grabbed = cursor.read( 16 )
+                    if not grabbed:
+                        break
+                    
+                    print ' '.join([
+                        two( hex( ord( c ) ).split('x')[1] )
+                        for c in grabbed[:8]
+                    ]),
+                    
+                    print '',
+                    
+                    print ' '.join([
+                        two( hex( ord( c ) ).split('x')[1] )
+                        for c in grabbed[8:]
+                    ]),
+                    
+                    print ' ',
+                    
+                    print (
+                        '|'
+                        + ''.join( [ c if c.isalnum() else '.' for c in grabbed[:8] ] )
+                        + ' '
+                        + ''.join( [ c if c.isalnum() else '.' for c in grabbed[8:] ] )
+                        + '|'
+                    )
+                    
+                continue
+            
             if argument == '-copy':
                 # onerous restrictions to avoid disaster, for now
                 target = arguments.pop( 0 )
@@ -170,6 +212,30 @@ def main():
                             break
                     continue
             
+            if argument == '-magic':
+                # pipe the data from the file into the file command to determine type by magic
+                p = subprocess.Popen(
+                    [ 'file', '-' ] ,
+                    stdin  = subprocess.PIPE ,
+                    stdout = subprocess.PIPE ,
+                    stderr = subprocess.PIPE ,
+                )
+                
+                currentRado = currentModel.rado()
+                
+                ( stdout, stderr ) = p.communicate(
+                    currentRado.cursor().read( currentRado.size() )
+                )
+                
+                if p.returncode != 0:
+                    raise Exception( '"file" command failed with %s' % repr( stderr ) )
+                
+                else:
+                    print '# -magic : output of "file -"'
+                    print stdout
+                
+                continue
+            
             # unknown command or child selector
             
             if argument and argument[0] == '-':
@@ -195,8 +261,9 @@ def main():
             str( currentModel.is_radoable() ) ,
             )
             
-        print '# done'
-
+        print '# done reads:%s' % (
+            repr( fileBlockDevice.get_blocks_read() ) ,
+            )
 
 def fail( message ):
     print '# ! %s' % message

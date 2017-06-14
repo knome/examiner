@@ -14,6 +14,9 @@
 #   https://people.gnome.org/~markmc/qcow-image-format.html
 #   https://code.google.com/p/theunarchiver/wiki/StuffItFormat
 #   https://code.google.com/p/theunarchiver/wiki/StuffIt5Format
+#   http://www.russotto.net/arseniccomp.html
+#   https://www.win.tue.nl/~aeb/linux/fs/fat/fat-1.html
+#   http://www.tavi.co.uk/phobos/fat.html
 
 # Thanks.
 
@@ -136,6 +139,9 @@ class Cursor():
     
     def tell( self ):
         return self._position
+    
+    def eof( self ):
+        return self._position == self._rado.size()
     
     def end( self ):
         self._position = self._rado.size()
@@ -374,6 +380,8 @@ class File__BlockDevice():
         # sneaky seek to end to get filesize
         self._fileobj.seek( 0, 2 )
         self._size = self._fileobj.tell()
+        
+        self._blocksRead = 0
         return
     
     def __repr__( self ):
@@ -381,6 +389,9 @@ class File__BlockDevice():
             repr( self._name    ) ,
             repr( self._fileobj ) ,
             )
+    
+    def get_blocks_read( self ):
+        return self._blocksRead
     
     def block_size( self ):
         return FILE_BLOCK_SIZE
@@ -390,6 +401,8 @@ class File__BlockDevice():
     
     @Common.memoize( 'file-blocks' )
     def get_block( self, blockNo ):
+        
+        self._blocksRead += 1
         
         DEBUG_FILE( 'FILE[:position=%s:amount=%s]' % (
                 str( blockNo * FILE_BLOCK_SIZE ),
@@ -537,7 +550,8 @@ class RadoZero():
         return self._size
     
     def readatlen( self, position, amount ):
-        return '\0', amount
+        # requires radorado to do limits?
+        return '\0' * amount, amount
 
 
 ###############################################################################################
@@ -665,7 +679,8 @@ def model_by_name( name ):
 
 
 class ModelUnknownBlob():
-    # generic unknown whatever, used as initial model
+    # generic unknown whatever
+    
     name = 'unknown-blob'
     
     def __init__( self, rado ):
@@ -718,9 +733,10 @@ class FileSystem__CompactDiskFileSystem():
         volumeDescriptorOffset = self._SYSTEM_AREA_SIZE
         while True:
             volumeDescriptorRado = RadoRado(
-                rado   = self._rado                   ,
-                offset = volumeDescriptorOffset       ,
-                size   = self._VOLUME_DESCRIPTOR_SIZE ,
+                name   = 'cdfs-volume-descriptor-rado' ,
+                rado   = self._rado                    ,
+                offset = volumeDescriptorOffset        ,
+                size   = self._VOLUME_DESCRIPTOR_SIZE  ,
                 )
             
             volumeDescriptorCursor = volumeDescriptorRado.cursor()
@@ -940,8 +956,14 @@ class FileSystem__CompactDiskFileSystem__IsoDirectory():
             filename    = directoryRecord.get( 'filename-identifier' )
             isDirectory = directoryRecord.get( 'flags' ).get( 'directory' )
             
+            # disabling listing these so that -ff works better
+            # 
             if filename in '\x00\x01':
                 filename = { '\x00' : '.', '\x01' : '..' }[ filename ]
+                
+                # this is the disabler
+                # 
+                continue
             
             filetype = 'directory' if isDirectory else 'file'
             
@@ -1310,6 +1332,8 @@ class DiskImage__AppleDiskImage():
 
 
 class DiskImage__AppleDiskImage__Partition():
+    name = 'disk-image--apple-disk-image--partition'
+    
     def __init__( self, rado, kolyBlock, xmlData, partitionDescriptor ):
         self._rado                = rado
         self._kolyBlock           = kolyBlock
@@ -2874,28 +2898,30 @@ class FileSystem__Ext__InodeContents__BlockDevice():
     
     @Common.memoize( 'ext-inode-contents-blocks' )
     def get_block( self, blockNo ):
-        rawBlockNo       = self._get_raw_block_no(
+        rawBlockNo = self._get_raw_block_no(
             contentsBlockNo = blockNo ,
             )
         
-        rawBlockPosition = rawBlockNo * self._fileSystemExt._get_block_size()
+        return self.get_raw_block( rawBlockNo )
         
-        blockSize = self.block_size()
+    def get_raw_block( self, rawBlockNo ):
         
-        remainingData = max(
-            self.size() - ( blockNo * blockSize ) ,
-            0                                     ,
+        availableBlocks = (
+            self._fileSystemExt._rado.size() / self.block_size()
             )
         
-        remainingDataInBlock = min(
-            remainingData ,
-            blockSize     ,
-            )
+        if rawBlockNo > availableBlocks:
+            raise Exception(
+                'requested block beyond end of underlying device'
+                )
+        
+        rawBlockPosition = rawBlockNo * self.block_size()
         
         return RadoRado(
-            self._fileSystemExt._rado     ,
-            offset = rawBlockPosition     ,
-            size   = remainingDataInBlock ,
+            name   = 'inode-contents-block-rado' ,
+            rado   = self._fileSystemExt._rado   ,
+            offset = rawBlockPosition            ,
+            size   = self.block_size()           ,
             )
     
     def _get_raw_block_no( self, contentsBlockNo ):
@@ -2922,7 +2948,10 @@ class FileSystem__Ext__InodeContents__BlockDevice():
     def _get_raw_block_no_via_extents( self, contentsBlockNo ):
         # to get to the given block entry, we have to walk all entries upto it
         
-        cursor = RadoBlob( self._inodeDescriptor.get( 'block-map' ) ).cursor()
+        cursor = RadoBlob(
+            name = 'ext-extent-inode-block-map-blob-rado-cursor' ,
+            blob = self._inodeDescriptor.get( 'block-map' )      ,
+            ).cursor()
         
         currentExtentHeader = self._read_ext4_extent_header( cursor )
         
@@ -2930,7 +2959,6 @@ class FileSystem__Ext__InodeContents__BlockDevice():
             
             for _ in xrange( currentExtentHeader.get( 'entries' ) ):
                 extent = self._read_ext4_extent( cursor )
-                # print extent
                 
                 desiredBlockContainedInExtent = (
                     extent.get( 'block' ) 
@@ -2981,17 +3009,23 @@ class FileSystem__Ext__InodeContents__BlockDevice():
     
     def _get_raw_block_no_via_indirect_blocks( self, contentsBlockNo ):
         
-        cursor = RadoBlob( self._inodeDescriptor.get( 'block-map' ) ).cursor()
+        cursor = RadoBlob(
+            name = 'block-map-rado'                         ,
+            blob = self._inodeDescriptor.get( 'block-map' ) ,
+            ).cursor()
         
         # print repr( self._inodeDescriptor.get( 'block-map' ) )
         
-        directs = [ cursor.uint32lsb() for _ in xrange( 11 ) ]
+        # fixed typo here, had 11, was only grabbing first 10 pointers
+        # changed to 12 to grab all 11
+        # 
+        directs = [ cursor.uint32lsb() for _ in xrange( 12 ) ]
         
         singleIndirect = cursor.uint32lsb()
         doubleIndirect = cursor.uint32lsb()
         tripleIndirect = cursor.uint32lsb()
         
-        if contentsBlockNo < 11:
+        if contentsBlockNo < 12:
             
             rawBlockNo = directs[ contentsBlockNo ]
             
@@ -3002,8 +3036,38 @@ class FileSystem__Ext__InodeContents__BlockDevice():
             
             return rawBlockNo
         
-        else:
-            raise Exception( 'indirect lookup unimplemented' )
+        singleIndirectBlocksFirst = 12
+        singleIndirectBlocksLast  = ( self.block_size() / 4 ) + 11
+        
+        if ( singleIndirectBlocksFirst <= contentsBlockNo <= singleIndirectBlocksLast ):
+            if not singleIndirect:
+                raise Exception( 'asked for indirect block, no indirect blocks' )
+            
+            indirectBlock = self.get_raw_block( singleIndirect )
+            cursor = indirectBlock.cursor()
+            cursor.skip( 4 * ( contentsBlockNo - 12 ) )
+            actualRawBlockNo = cursor.uint32lsb()
+            return actualRawBlockNo
+        
+        doubleIndirectBlocksFirst = ( self.block_size() / 4 ) + 12
+        doubleIndirectBlocksLast  = ( self.block_size() / 4 ) ** 2 + ( self.block_size() / 4 ) + 11
+        
+        if ( doubleIndirectBlocksFirst <= contentsBlockNo <= doubleIndirectBlocksLast ):
+            slot               = ( contentsBlockNo - singleIndirectBlocksLast )
+            indirectBlockSlot  = slot / ( self.block_size() / 4 )
+            indirectOffsetSlot = slot % ( self.block_size() / 4 )
+            
+            doubleBlockCursor = self.get_raw_block( doubleIndirect ).cursor()
+            doubleBlockCursor.skip( indirectBlockSlot * 4 )
+            
+            indirectBlockCursor = self.get_raw_block( doubleBlockCursor.uint32lsb() ).cursor()
+            indirectBlockCursor.skip( indirectOffsetSlot * 4 )
+            
+            return indirectBlockCursor.uint32lsb()
+            
+        raise Exception(
+            'unable to locate block : ( double indirect and triple indirect blocks unimplemented'
+            )
 
 
 class FileSystem__Ext__Directory():
@@ -3060,7 +3124,9 @@ class FileSystem__Ext__Directory():
                     )
     
     def _get_directory_entries( self, inodeDescriptor ):
-        contentsRado = RadoBlock( FileSystem__Ext__InodeContents__BlockDevice(
+        contentsRado = RadoBlock( 
+            name        = 'directory-inodes-blockdevice-rado' ,
+            blockDevice = FileSystem__Ext__InodeContents__BlockDevice(
                 fileSystemExt   = self._fileSystemExt ,
                 inodeDescriptor = inodeDescriptor     ,
                 ))
@@ -3144,7 +3210,12 @@ class FileSystem__Ext__RegularFile():
     
     def rado( self ):
         inodeDescriptor = self._fileSystemExt._get_inode_descriptor( self._inodeNo )
-        return RadoBlock( FileSystem__Ext__InodeContents__BlockDevice(
+        
+        print inodeDescriptor
+        
+        return RadoBlock( 
+            name        = 'ext-file-inode-blockdevice-rado' ,
+            blockDevice = FileSystem__Ext__InodeContents__BlockDevice(
                 fileSystemExt   = self._fileSystemExt ,
                 inodeDescriptor = inodeDescriptor     ,
                 ))
@@ -3228,6 +3299,21 @@ class Archive__Stuff_It():
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
 #- stuff it 5 archive ( updated format )
 #- 
+
+STUFFIT__COMPRESSION_ALGORITHMS = {
+    0  : 'no-compression'            ,
+    1  : 'rle90'                     ,
+    2  : 'compress'                  ,
+    3  : 'stuffit-huffman'           , # simple huffman encoding of individual bytes
+    # gap
+    5  : 'stuffit-lzah'              ,
+    # gap
+    8  : 'stuffit-miller-wegman'     ,
+    # gap
+    13 : 'stuffit-lzss-and-huffman'  ,
+    14 : '?'                         ,
+    15 : 'stuffit-arsenic'           , # bwt-and-arithmetic-coding
+}
 
 @model
 class Archive__Stuff_It_Five():
@@ -3586,24 +3672,206 @@ class Archive__Stuff_It_Five__Directory():
                         )
             else:
                 if header.get( 'file-header' ).get( 'file-name' ) == what:
-                    return Archive__Stuff_It_Five__File(
-                        rado   = self._rado ,
-                        base   = self._base ,
-                        header = header     ,
-                        )
-                
+                    return RadoBlock(
+                        name        = 'stuffit5--file--blockdevice--rado' ,
+                        blockDevice = Archive__Stuff_It_Five__File__BlockDevice(
+                            rado   = self._rado ,
+                            base   = self._base ,
+                            header = header     ,
+                            ))
         return None
 
-
-class Archive__Stuff_It_Five__File():
+class Archive__Stuff_It_Five__File__BlockDevice():
     def __init__( self, rado, base, header ):
         self._rado   = rado
         self._base   = base
         self._header = header
         
+        print self._header
+    
+    def block_size( self ):
+        return 512
+    
+    def size( self ):
+        raise Exception( 'unimplemented' )
+    
+    def get_block( self, blockNo ):
         raise Exception( 'file unimplemented' )
 
+
+class Archive__Stuff_It_Five__File__BlockDevice__SectorWalker():
+    # where sectors are fixed size blocks
+    # and may need to perform specific decoding of
+    # the underlying data, it prevents us from jumping to a
+    # specific block easily
+    # instead, we keep track of previously decoded-to sectors
+    # and find the closest previously decoded-to sector
+    # to work our way to where we need to be
+    # 
+    # we store the last X sectors that have had sector_data
+    # read from them?
+    # 
+    
+    @staticmethod
+    def new( rado, initialRadoOffset ):
+        return Archive__Stuff_It_Five__File__BlockDevice__SectorWalker(
+            rado       = rado              ,
+            radoOffset = initialRadoOffset ,
+            byteOffset = 0                 ,
+            sectorNo   = 0                 ,
+            )
+    
+    def __init__( self, rado, sectorNo ):
+        self._rado       = rado
+        self._radoOffset = radoOffset     # we need to know what byte we're reading from
+        self._byteOffset = byteOffset     # we read a bit at a time in this algorithm
+        self._sectorNo   = sectorNo       # this is just an artificial way to know where we are
         
+        self._data       = self._decode() # decode our own chunk of the data
+                                          # if we can't get a full sector-size, that's okay
+        
+        # push byte at a time into decoder and let it keep track of byte offset?
+        
+        return
+    
+    def _decode( self ):
+        raise Exception( 'do what?' )
+        
+    def get_sector_size( self ):
+        # I'm arbitrarily choosing this right now
+        # 
+        return 512
+    
+    def get_sector_no( self ):
+        return self._sectorNo
+    
+    # return the data associated with this specific sector
+    # 
+    def get_sector_data( self ):
+        raise Exception( 'unimplemented' )
+    
+    # return the sector after this one
+    # 
+    def next_sector( self ):
+        raise Exception( 'unimplemented' )
+
+
+class StuffIt5__Arsenic__Decoder():
+    
+    # I'm not quite sure how any of this works. It's going to take some
+    # time and research to get this algorithm correct, I think
+    
+    # contruct values lsb first
+    # read 8 bit value yielding 0x41 # A
+    # read 8 bit value yielding 0x73 # s -> As == Arsenic
+    # read 4 bit value yielding code for 
+    #   block size of block sorter
+    #   ( log2 block_size ) - 9. block size must be 2**9 -> 2**24 inclusive
+    # following block size are blocks
+    #   for each
+    #     selector model and models 3-9 are re-initialized, also MTF decoder
+    #     read bit yielding -> 1:EOF        0:NORMAL ; if EOF read no more
+    #     read bit yielding -> 1:RANDOMIZED 0:NORMAL ;
+    # 
+    #     read blockbits: index of last character for block sort
+    #       I don't know what this means yet
+    # 
+    
+    def __init__( self ):
+        self._nbits = 26
+        self._one   = 1 << ( self._nbits - 1 )
+        self._half  = 1 << ( self._nbits - 2 )
+        
+        # initialization
+        self._range = self._one
+        self._code  = 0
+        for i in xrange( 1, self._nbits + 1 ):
+            self._code = ( self._code << 1 ) | self._getbitFn()
+        
+        return
+
+
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+#- FAT
+#- 
+
+@model
+class FileSystem__FAT():
+    name = 'file-system--fat'
+    
+    @staticmethod
+    def matches( rado ):
+        # FAT formats start with a 3 byte far or near jump in asm
+        # this is probably a terrible way to determine this
+        # 
+        
+        cursor = rado.cursor()
+        
+        # uses same magic as mbr to indicate bootable sector
+        # 
+        cursor.seek( 510 )
+        magic = cursor.read( 2 )
+        if magic != '\x55\xaa':
+            return False
+        
+        # docs said always eb xx 90
+        # not so in LILO image. *shrug*
+        # 
+        
+        cursor.seek( 0 )
+        jump   = cursor.read( 3 )
+        if jump[0] == '\xeb' and jump[2] == '\x90':
+            # far jump
+            return True
+        elif jump [0] == '\xe9':
+            # near jump
+            return True
+        else:
+            # not a jump
+            return False
+    
+    def __init__( self, rado ):
+        self._rado       = rado
+        
+        self._bootSector = self._read_boot_sector( rado )
+        
+        print 'FAT'
+        print self._bootSector
+        
+        return
+    
+    def is_listable( self ): return True
+    def is_radoable( self ): return False
+    
+    def _read_boot_sector( self, rado ):
+        attributes = Attributes()
+        cursor     = rado.cursor()
+        
+        cursor.seek( 3 )
+        attributes.put( 'oem-name'              , cursor.read( 8 ) )
+        
+        attributes.put( '@at', cursor.tell() )
+        
+        attributes.put( 'bytes-per-sector'      , cursor.uint16lsb() )
+        attributes.put( 'sectors-per-cluster'   , cursor.uint8()     )
+        attributes.put( 'reserved-sectors'      , cursor.uint16lsb() )
+        attributes.put( 'fat-copies'            , cursor.uint8()     )
+        attributes.put( 'root-directory-entries', cursor.uint16lsb() )
+        attributes.put( 'sectors-in-filesystem' , cursor.uint16lsb() )
+        attributes.put( 'media-descriptor-type' , cursor.uint8()     )
+        attributes.put( 'sectors-per-fat'       , cursor.uint16lsb() )
+        attributes.put( 'sectors-per-track'     , cursor.uint16lsb() )
+        attributes.put( 'number-of-heads'       , cursor.uint16lsb() )
+        attributes.put( 'hidden-sectors'        , cursor.uint16lsb() )
+        
+        attributes.put( '@end'                  , cursor.tell()      )
+        
+        return attributes
+    
+
+    
+
 #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
 #- test block layout
 #- 
@@ -3635,6 +3903,78 @@ class Test__BlockLayout():
         cursor = self._rado.cursor()
         
         cursor.seek( int( no ) * 4096 )
-        v = cursor.uint32lsb()
+        # v = cursor.uint32lsb()
+        # print 'FOUND', v
         
-        print 'FOUND', v
+        return ModelUnknownBlob(
+            rado = cursor.rado( 4096 ) ,
+        )
+
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+#- ar archive
+#- 
+
+@model
+class Archive_Ar():
+    name = 'archive--ar'
+    
+    @staticmethod
+    def matches( rado ):
+        cursor = rado.cursor()
+        return '!<arch>' == cursor.read( 7 )
+    
+    def __init__( self, rado ):
+        self._rado = rado
+        return
+    
+    def is_listable( self ): return True
+    def is_radoable( self ): return False
+    
+    def list( self ):
+        return [
+            ( f.get('filename'), 'file' )
+            for f in self._files()
+        ]
+    
+    def _files( self ):
+        
+        cursor = self._rado.cursor()
+        cursor.skip( 8 )
+        
+        files = []
+        
+        while not cursor.eof():
+            attributes = Attributes()
+            attributes.put( 'filename', cursor.read( 16 ).rstrip(' ') )
+            attributes.put( 'modified', cursor.read( 12 ).rstrip(' ') )
+            attributes.put( 'owner-id', cursor.read(  6 ).rstrip(' ') )
+            attributes.put( 'group-id', cursor.read(  6 ).rstrip(' ') )
+            attributes.put( 'mode'    , cursor.read(  8 ).rstrip(' ') )
+            attributes.put( 'filesize', cursor.read( 10 ).rstrip(' ') )
+            attributes.put( 'magic'   , cursor.read(  2 ).rstrip(' ') )
+            attributes.put( '@offset' , cursor.tell() )
+            
+            files.append( attributes )
+            
+            cursor.skip( int( attributes.get('filesize') ) )
+            
+            # account for padding byte here?
+            if not cursor.eof() and cursor.tell() & 1:
+                cursor.skip( 1 )
+            
+        return files
+    
+    def select( self, what ):
+        for f in self._files():
+            if what == f.get('filename'):
+                cursor = self._rado.cursor()
+                cursor.skip( f.get('@offset') )
+                return ModelUnknownBlob(
+                    rado = cursor.rado( int( f.get('filesize') ) ) ,
+                )
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+#- tar archive
+#- 
+
