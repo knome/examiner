@@ -3978,3 +3978,95 @@ class Archive_Ar():
 #- tar archive
 #- 
 
+# apparently started to add this.
+# used to have a personal tar
+# module, but lost it somewhere
+# along the way.
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+#- cpio ( an old unix archive format )
+
+# https://www.mkssoftware.com/docs/man4/cpio.4.asp
+
+@model
+class Archive__CpioNewAsciiFormat():
+    name = 'archive--cpio--new-ascii-format'
+    
+    @staticmethod
+    def matches( rado ):
+        cursor = rado.cursor()
+        magic = cursor.read( 6 )
+        return magic == '070701'
+    
+    def __init__( self, rado ):
+        self._rado = rado
+        return
+    
+    def is_listable( self ): return True
+    def is_radoable( self ): return False
+    
+    def list( self ):
+        return [
+            containedFile.get('@filename' )
+            for containedFile in self._contained_files()
+        ]
+    
+    def _contained_files( self ):
+        cursor = self._rado.cursor()
+        
+        fullSize = self._rado.size()
+        
+        while True:
+            headerStart = cursor.tell()
+            header = self._read_header( cursor )
+            headerSize = cursor.tell() - headerStart
+            
+            # they pad name with nuls so header + name ends on a multiple of 4
+            # 
+            paddedNameSize = self._padded_size( header.get( 'namesize' ), offset = headerSize )
+            paddedName = cursor.read( paddedNameSize )
+            fileName = paddedName[ : header.get('namesize') - 1 ]
+            
+            # lol, what a ridiculous way to end it
+            # 
+            print repr( fileName )
+            if fileName == 'TRAILER!!!' and header.get('filesize') == 0:
+                break
+            
+            header.put( '@filename', fileName ) # :-1 to ignore nul byte
+            
+            yield header
+            
+            paddedFileSize = self._padded_size( header.get( 'filesize' ) )
+            cursor.skip( header.get('filesize') )
+
+        if cursor.tell() != fullSize:
+            print 'upcoming', repr( cursor.read( fullSize - cursor.tell() ) )
+            attributes = Attributes()
+            attributes.put( '@filename', '@trailingData' )
+            yield attributes
+    
+    def _read_header( self, cursor ):
+        attributes = Attributes()
+        
+        attributes.put( 'magic'    , cursor.read( 6 )            )
+        attributes.put( 'ino'      , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'mode'     , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'uid'      , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'gid'      , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'nlink'    , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'mtime'    , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'filesize' , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'devmajor' , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'devminor' , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'rdevmajor', int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'rdevminor', int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'namesize' , int( cursor.read( 8 ), 16 ) )
+        attributes.put( 'check'    , int( cursor.read( 8 ), 16 ) )
+        
+        return attributes
+    
+    def _padded_size( self, namesize, offset = 0 ):
+        # round up to next multiple of 4
+        return namesize + ( 4 - ( ( ( namesize + offset ) % 4 ) or 4 ) )
+    
